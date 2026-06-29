@@ -167,7 +167,14 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
     /// Fulfill an egress bundle, subject to dedup, rate limits, policy, and size
     /// caps. The response is sealed back to the request's `src` address.
     pub fn fulfill(&mut self, request: &Bundle, now_ms: u64) -> Result<FulfillOutcome> {
-        if !matches!(request.inner.dst, Destination::InternetEgress) {
+        // Egress requests are now device-addressed to the gateway (like a hop-endpoint),
+        // not a mesh-visible `InternetEgress` destination — the mesh can't tell an egress
+        // request from any other peer message (§30, privacy by default).
+        let to_us = match &request.inner.dst {
+            Destination::Device(d) => *d == self.address(),
+            _ => false,
+        };
+        if !to_us {
             return Ok(FulfillOutcome::NotForUs);
         }
         request.verify()?;
@@ -253,7 +260,7 @@ mod tests {
     fn request(client: &Identity, gw_x: &PubKeyBytes, method: &str, url: &str, body: Vec<u8>) -> Bundle {
         Bundle::create(
             client,
-            Destination::InternetEgress,
+            Destination::Device(*gw_x),
             gw_x,
             &Payload::HttpRequest {
                 host: String::new(),
