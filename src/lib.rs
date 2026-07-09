@@ -107,9 +107,9 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            dedup_ttl_ms: 600_000,         // 10 min
+            dedup_ttl_ms: 600_000, // 10 min
             max_requests_per_window: 60,
-            rate_window_ms: 60_000,        // 1 min
+            rate_window_ms: 60_000, // 1 min
             max_request_bytes: 64 * 1024,
         }
     }
@@ -181,13 +181,20 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
 
         // Dedup within the TTL window (DESIGN.md §7) — pruned to bound memory.
         let ttl = self.config.dedup_ttl_ms;
-        self.fulfilled.retain(|_, &mut t| now_ms.saturating_sub(t) < ttl);
+        self.fulfilled
+            .retain(|_, &mut t| now_ms.saturating_sub(t) < ttl);
         if self.fulfilled.contains_key(&request.id()) {
             return Ok(FulfillOutcome::Duplicate);
         }
 
-        let Payload::HttpRequest { method, url, headers, body, max_resp_bytes, .. } =
-            request.open(&self.identity)?
+        let Payload::HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+            max_resp_bytes,
+            ..
+        } = request.open(&self.identity)?
         else {
             return Ok(FulfillOutcome::NotForUs);
         };
@@ -202,7 +209,13 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
             return Ok(FulfillOutcome::RateLimited);
         }
 
-        let result = self.client.perform(HttpCall { method, url, headers, body, max_resp_bytes });
+        let result = self.client.perform(HttpCall {
+            method,
+            url,
+            headers,
+            body,
+            max_resp_bytes,
+        });
 
         let mut resp_body = result.body;
         resp_body.truncate(max_resp_bytes as usize);
@@ -257,7 +270,13 @@ mod tests {
         }
     }
 
-    fn request(client: &Identity, gw_x: &PubKeyBytes, method: &str, url: &str, body: Vec<u8>) -> Bundle {
+    fn request(
+        client: &Identity,
+        gw_x: &PubKeyBytes,
+        method: &str,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Bundle {
         Bundle::create(
             client,
             Destination::Device(*gw_x),
@@ -296,10 +315,14 @@ mod tests {
         }
 
         // Duplicate within TTL is rejected...
-        assert!(matches!(gw.fulfill(&req, 2).unwrap(), FulfillOutcome::Duplicate));
+        assert!(matches!(
+            gw.fulfill(&req, 2).unwrap(),
+            FulfillOutcome::Duplicate
+        ));
         // ...but after the TTL elapses, the id is forgotten and it's served again.
         assert!(matches!(
-            gw.fulfill(&req, 2 + GatewayConfig::default().dedup_ttl_ms).unwrap(),
+            gw.fulfill(&req, 2 + GatewayConfig::default().dedup_ttl_ms)
+                .unwrap(),
             FulfillOutcome::Response(_)
         ));
     }
@@ -307,7 +330,10 @@ mod tests {
     #[test]
     fn rate_limits_per_source() {
         let client = Identity::generate();
-        let cfg = GatewayConfig { max_requests_per_window: 2, ..Default::default() };
+        let cfg = GatewayConfig {
+            max_requests_per_window: 2,
+            ..Default::default()
+        };
         let mut gw = Gateway::with_config(Identity::generate(), FakeHttp, AllowAll, cfg);
 
         // Three distinct requests (different bodies → different ids) from one source.
@@ -315,9 +341,18 @@ mod tests {
         let r2 = request(&client, &gw.address(), "GET", "https://a.com", vec![2]);
         let r3 = request(&client, &gw.address(), "GET", "https://a.com", vec![3]);
 
-        assert!(matches!(gw.fulfill(&r1, 0).unwrap(), FulfillOutcome::Response(_)));
-        assert!(matches!(gw.fulfill(&r2, 1).unwrap(), FulfillOutcome::Response(_)));
-        assert!(matches!(gw.fulfill(&r3, 2).unwrap(), FulfillOutcome::RateLimited));
+        assert!(matches!(
+            gw.fulfill(&r1, 0).unwrap(),
+            FulfillOutcome::Response(_)
+        ));
+        assert!(matches!(
+            gw.fulfill(&r2, 1).unwrap(),
+            FulfillOutcome::Response(_)
+        ));
+        assert!(matches!(
+            gw.fulfill(&r3, 2).unwrap(),
+            FulfillOutcome::RateLimited
+        ));
     }
 
     #[test]
@@ -329,22 +364,35 @@ mod tests {
 
         // Allowed: GET https to an allowed host (and a subdomain).
         assert!(matches!(
-            gw.fulfill(&request(&client, &gx, "GET", "https://api.example.com/x", vec![]), 0).unwrap(),
+            gw.fulfill(
+                &request(&client, &gx, "GET", "https://api.example.com/x", vec![]),
+                0
+            )
+            .unwrap(),
             FulfillOutcome::Response(_)
         ));
         // Wrong method.
         assert!(matches!(
-            gw.fulfill(&request(&client, &gx, "POST", "https://example.com", vec![]), 1).unwrap(),
+            gw.fulfill(
+                &request(&client, &gx, "POST", "https://example.com", vec![]),
+                1
+            )
+            .unwrap(),
             FulfillOutcome::PolicyDenied
         ));
         // Not https.
         assert!(matches!(
-            gw.fulfill(&request(&client, &gx, "GET", "http://example.com", vec![]), 2).unwrap(),
+            gw.fulfill(
+                &request(&client, &gx, "GET", "http://example.com", vec![]),
+                2
+            )
+            .unwrap(),
             FulfillOutcome::PolicyDenied
         ));
         // Disallowed host.
         assert!(matches!(
-            gw.fulfill(&request(&client, &gx, "GET", "https://evil.com", vec![]), 3).unwrap(),
+            gw.fulfill(&request(&client, &gx, "GET", "https://evil.com", vec![]), 3)
+                .unwrap(),
             FulfillOutcome::PolicyDenied
         ));
     }
@@ -352,10 +400,22 @@ mod tests {
     #[test]
     fn rejects_oversized_request_body() {
         let client = Identity::generate();
-        let cfg = GatewayConfig { max_request_bytes: 16, ..Default::default() };
+        let cfg = GatewayConfig {
+            max_request_bytes: 16,
+            ..Default::default()
+        };
         let mut gw = Gateway::with_config(Identity::generate(), FakeHttp, AllowAll, cfg);
-        let req = request(&client, &gw.address(), "GET", "https://example.com", vec![0u8; 17]);
-        assert!(matches!(gw.fulfill(&req, 0).unwrap(), FulfillOutcome::RequestTooLarge));
+        let req = request(
+            &client,
+            &gw.address(),
+            "GET",
+            "https://example.com",
+            vec![0u8; 17],
+        );
+        assert!(matches!(
+            gw.fulfill(&req, 0).unwrap(),
+            FulfillOutcome::RequestTooLarge
+        ));
     }
 
     #[test]
@@ -368,10 +428,16 @@ mod tests {
             &client,
             Destination::Device(gw_id.address()),
             &gw_id.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: vec![] },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: vec![],
+            },
             BundleOpts::default(),
         )
         .unwrap();
-        assert!(matches!(gw.fulfill(&b, 0).unwrap(), FulfillOutcome::NotForUs));
+        assert!(matches!(
+            gw.fulfill(&b, 0).unwrap(),
+            FulfillOutcome::NotForUs
+        ));
     }
 }
