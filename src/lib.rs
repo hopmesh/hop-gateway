@@ -6,10 +6,19 @@
 //! well-known gateway key, response sealed to the origin's `src_x`).
 //!
 //! The HTTP client is injected via [`HttpClient`] so fulfillment logic is testable
-//! without a network; a `tokio` + `reqwest` impl is the production backend.
+//! without a network; a blocking `reqwest` impl ([`ReqwestHttpClient`]) is the production
+//! backend, enforcing connect/read timeouts and a streaming response-size cap.
 //!
 //! Abuse controls (DESIGN.md §9): TTL-bounded request dedup, per-source rate
 //! limiting, an allowlist [`EgressPolicy`], and request/response size caps.
+//!
+//! Two entry points share the same abuse controls:
+//!
+//!  * [`Gateway::fulfill`] operates on a raw sealed [`Bundle`] (unseals, performs, reseals the
+//!    response back to the origin). Used directly + in tests.
+//!  * [`Gateway::screen`] operates on an already-decoded request (the shape a Hop [`Node`] surfaces
+//!    via `take_http_requests`), returning an allow/deny decision so the `hop-gateway` binary can
+//!    let the node do the sealing/routing while the gateway keeps ownership of the abuse controls.
 
 use std::collections::HashMap;
 
@@ -40,6 +49,21 @@ pub trait HttpClient {
 /// Policy gate for which requests a gateway is willing to make (DESIGN.md §9).
 pub trait EgressPolicy {
     fn allows(&self, method: &str, url: &str) -> bool;
+}
+
+/// A placeholder [`HttpClient`] that never performs a request (returns 500). Used when a caller
+/// drives fulfillment via [`Gateway::screen`] and owns the fetch itself (the `hop-gateway` binary),
+/// so the gateway's `C` parameter is present but unused. Calling `perform` is a programming error.
+pub struct NoHttpClient;
+impl HttpClient for NoHttpClient {
+    fn perform(&self, _call: HttpCall) -> HttpResult {
+        HttpResult {
+            status: 500,
+            headers: vec![],
+            body: b"hop-gateway: NoHttpClient::perform called (use screen() + your own client)"
+                .to_vec(),
+        }
+    }
 }
 
 /// Permit everything — for tests/dev only. Production ships an [`Allowlist`].
@@ -280,6 +304,154 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         let hits = self.rate.entry(src).or_default();
         hits.retain(|&t| now_ms.saturating_sub(t) < window);
         hits.len() as u32 >= self.config.max_requests_per_window
+    }
+
+    /// Apply the abuse controls (dedup, rate limit, policy, size cap) to an already-decoded egress
+    /// request, WITHOUT unsealing a bundle or performing the fetch. This is the seam the
+    /// `hop-gateway` binary uses: a Hop [`Node`] surfaces decoded requests + seals the response, so
+    /// the gateway keeps ownership of the abuse controls while the node owns transport/crypto.
+    ///
+    /// `id`/`src` identify the request for dedup + per-source rate accounting; on [`Screen::Allow`]
+    /// the id and source are recorded (so a later duplicate is rejected and the source's rate ticks).
+    /// The caller then performs the fetch and routes the response by `id`.
+    pub fn screen(
+        &mut self,
+        id: BundleId,
+        src: PubKeyBytes,
+        method: &str,
+        url: &str,
+        body_len: usize,
+        now_ms: u64,
+    ) -> Screen {
+        // Prune both maps to bound memory (same as fulfill()).
+        let ttl = self.config.dedup_ttl_ms;
+        self.fulfilled
+            .retain(|_, &mut t| now_ms.saturating_sub(t) < ttl);
+        let window = self.config.rate_window_ms;
+        self.rate.retain(|_, hits| {
+            hits.retain(|&t| now_ms.saturating_sub(t) < window);
+            !hits.is_empty()
+        });
+
+        if self.fulfilled.contains_key(&id) {
+            return Screen::Duplicate;
+        }
+        if body_len > self.config.max_request_bytes {
+            return Screen::RequestTooLarge;
+        }
+        if !self.policy.allows(method, url) {
+            return Screen::PolicyDenied;
+        }
+        if self.is_rate_limited(src, now_ms) {
+            return Screen::RateLimited;
+        }
+        // Accepted: record for dedup + rate accounting, then let the caller perform the fetch.
+        self.fulfilled.insert(id, now_ms);
+        self.rate.entry(src).or_default().push(now_ms);
+        Screen::Allow
+    }
+}
+
+/// The decision [`Gateway::screen`] returns for a decoded egress request. `Allow` means the caller
+/// should perform the fetch and route the response; every other variant is a rejection the caller
+/// turns into an error response (or drops).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Allow,
+    Duplicate,
+    RateLimited,
+    PolicyDenied,
+    RequestTooLarge,
+}
+
+/// The production HTTP backend (services-02): a blocking `reqwest` client that enforces connect and
+/// read timeouts, disables redirects (so a backend can't bounce an egress fetch off-allowlist), and
+/// streams the response body with a hard cap at `max_resp_bytes` so a huge/endless response can't
+/// exhaust gateway memory. Gated behind the `reqwest` feature so the trait-only lib stays lean.
+#[cfg(feature = "reqwest")]
+pub struct ReqwestHttpClient {
+    http: reqwest::blocking::Client,
+}
+
+#[cfg(feature = "reqwest")]
+impl ReqwestHttpClient {
+    /// Build a client with a total request `timeout` and a separate `connect_timeout`. Redirects are
+    /// disabled (an egress fetch must hit exactly the allowlisted URL, never a redirect target).
+    pub fn new(timeout: std::time::Duration, connect_timeout: std::time::Duration) -> Self {
+        let http = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build reqwest client");
+        Self { http }
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        )
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl HttpClient for ReqwestHttpClient {
+    fn perform(&self, call: HttpCall) -> HttpResult {
+        use std::io::Read;
+        let method = match reqwest::Method::from_bytes(call.method.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                return HttpResult {
+                    status: 400,
+                    headers: vec![],
+                    body: b"hop-gateway: bad method".to_vec(),
+                }
+            }
+        };
+        let mut req = self.http.request(method, &call.url);
+        for (k, v) in &call.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if !call.body.is_empty() {
+            req = req.body(call.body);
+        }
+        let mut resp = match req.send() {
+            Ok(r) => r,
+            Err(_) => {
+                return HttpResult {
+                    status: 502,
+                    headers: vec![],
+                    body: b"hop-gateway: upstream unreachable".to_vec(),
+                }
+            }
+        };
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        // Stream the body with a hard cap: read at most max_resp_bytes+1 and truncate, so an
+        // endless/oversized response can't exhaust memory (the +1 lets the gateway note truncation
+        // if it ever wants to; here we simply cap).
+        let cap = call.max_resp_bytes as usize;
+        let mut body = Vec::new();
+        let mut limited = (&mut resp).take(cap as u64 + 1);
+        let _ = limited.read_to_end(&mut body);
+        body.truncate(cap);
+        HttpResult {
+            status,
+            headers,
+            body,
+        }
     }
 }
 
@@ -531,5 +703,82 @@ mod tests {
             gw.fulfill(&b, 0).unwrap(),
             FulfillOutcome::NotForUs
         ));
+    }
+
+    // --- services-02: the `screen` seam the binary uses (node decodes + seals; gateway screens). ---
+
+    #[test]
+    fn screen_applies_all_abuse_controls() {
+        let src = Identity::generate();
+        let policy = Allowlist::new(&["GET"], &["example.com"], true);
+        let cfg = GatewayConfig {
+            max_requests_per_window: 2,
+            max_request_bytes: 16,
+            ..Default::default()
+        };
+        let mut gw = Gateway::with_config(Identity::generate(), FakeHttp, policy, cfg);
+        let s = src.address();
+        let id = |n: u8| {
+            let mut b = [0u8; 32];
+            b[0] = n;
+            b
+        };
+
+        // Policy: wrong method / non-https / off-allowlist host are denied.
+        assert_eq!(
+            gw.screen(id(1), s, "POST", "https://example.com/", 0, 0),
+            Screen::PolicyDenied
+        );
+        assert_eq!(
+            gw.screen(id(2), s, "GET", "http://example.com/", 0, 0),
+            Screen::PolicyDenied
+        );
+        assert_eq!(
+            gw.screen(id(3), s, "GET", "https://evil.com/", 0, 0),
+            Screen::PolicyDenied
+        );
+        // Size cap.
+        assert_eq!(
+            gw.screen(id(4), s, "GET", "https://example.com/", 17, 0),
+            Screen::RequestTooLarge
+        );
+        // Allowed, and recorded: a duplicate id is then rejected.
+        assert_eq!(
+            gw.screen(id(5), s, "GET", "https://example.com/", 0, 0),
+            Screen::Allow
+        );
+        assert_eq!(
+            gw.screen(id(5), s, "GET", "https://example.com/", 0, 1),
+            Screen::Duplicate
+        );
+        // Rate limit: budget is 2/window; id(5) counted as 1, this is 2 (ok), the next is shed.
+        assert_eq!(
+            gw.screen(id(6), s, "GET", "https://example.com/", 0, 2),
+            Screen::Allow
+        );
+        assert_eq!(
+            gw.screen(id(7), s, "GET", "https://example.com/", 0, 3),
+            Screen::RateLimited
+        );
+    }
+
+    #[test]
+    fn screen_userinfo_host_is_not_bypassable() {
+        // services-01 + services-02: the same host-parsing guard applies through the screen() seam.
+        let src = Identity::generate();
+        let policy = Allowlist::new(&["GET"], &["example.com"], true);
+        let mut gw = Gateway::new(Identity::generate(), FakeHttp, policy);
+        assert_eq!(
+            gw.screen(
+                [9u8; 32],
+                src.address(),
+                "GET",
+                "https://example.com:x@evil.com/",
+                0,
+                0
+            ),
+            Screen::PolicyDenied,
+            "userinfo trick must not smuggle an off-allowlist host past screen()"
+        );
     }
 }

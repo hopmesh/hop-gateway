@@ -6,5 +6,23 @@ license-file.workspace = true
 repository.workspace = true
 description = "Internet-egress node for Hop: fulfills HTTP-request bundles (DESIGN.md §9)."
 
+[[bin]]
+name = "hop-gateway"
+path = "src/main.rs"
+# The binary needs the production reqwest client + the relay-dial transport.
+required-features = ["reqwest"]
+
 [dependencies]
 hop-core.workspace = true
+bs58 = "0.5"
+# The production egress HTTP client (services-02): blocking reqwest with connect/read timeouts, no
+# redirects, and a streaming response cap. Optional so the trait-only lib stays lean.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+# The relay-dial bearer for the binary: a TLS WebSocket client (leaf reachable on the mesh, §30).
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+
+[features]
+# `reqwest` pulls the production HTTP client + the WebSocket bearer, which the binary requires. The
+# library (trait + abuse controls + fulfill/screen) builds with no features for embedding/testing.
+default = []
+reqwest = ["dep:reqwest", "dep:tungstenite"]
