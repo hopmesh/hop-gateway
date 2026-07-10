@@ -31,7 +31,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hop_core::prelude::*;
 use hop_gateway::{
-    Allowlist, Gateway, HttpCall, HttpClient, NoHttpClient, ReqwestHttpClient, Screen,
+    resolve_relay, Allowlist, Gateway, HttpCall, HttpClient, NoHttpClient, ReqwestHttpClient,
+    Screen,
 };
 use tungstenite::Message;
 
@@ -128,19 +129,14 @@ fn main() {
         }
     }
 
-    // Env fallbacks (so infra can gate the relay dial without a CLI change, like hop-endpoint).
-    if !relay_cli_set {
-        match std::env::var("HOP_NO_RELAY").as_deref() {
-            Ok("1") | Ok("true") | Ok("yes") => relay = None,
-            _ => {
-                if let Ok(url) = std::env::var("HOP_RELAY") {
-                    if !url.is_empty() {
-                        relay = Some(url);
-                    }
-                }
-            }
-        }
-    }
+    // services-r3-03: env fallbacks (so infra can gate the relay dial without a CLI change) via the
+    // ONE shared, tested precedence helper — identical to hop-endpoint, so the two cannot drift.
+    relay = resolve_relay(
+        relay,
+        relay_cli_set,
+        std::env::var("HOP_NO_RELAY").ok().as_deref(),
+        std::env::var("HOP_RELAY").ok().as_deref(),
+    );
 
     let identity = load_identity(&identity_file);
     if print_address {

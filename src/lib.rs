@@ -24,6 +24,34 @@ use std::collections::HashMap;
 
 use hop_core::prelude::*;
 
+/// services-r3-03: the ONE shared, tested graceful-degrade precedence for resolving the relay
+/// endpoint from (CLI, `HOP_NO_RELAY`, `HOP_RELAY`). Both the `hop-gateway` and `hop-endpoint`
+/// binaries call this so the two cannot drift, and a regression fails `resolve_relay_precedence`
+/// below rather than shipping. Pure (no process spawn, no env mutation) so it is unit-testable.
+///
+/// Precedence:
+///  * A CLI `--relay`/`--no-relay` (`cli_set = true`) ALWAYS wins; env is ignored entirely.
+///  * Otherwise `HOP_NO_RELAY` in {`1`,`true`,`yes`} forces no relay (degrade).
+///  * Otherwise a non-empty `HOP_RELAY` overrides the default relay URL.
+///  * Otherwise the passed-in default (`cli_relay`) stands.
+pub fn resolve_relay(
+    cli_relay: Option<String>,
+    cli_set: bool,
+    no_relay_env: Option<&str>,
+    relay_env: Option<&str>,
+) -> Option<String> {
+    if cli_set {
+        return cli_relay; // an explicit --relay/--no-relay is authoritative
+    }
+    match no_relay_env {
+        Some("1") | Some("true") | Some("yes") => None,
+        _ => match relay_env {
+            Some(url) if !url.is_empty() => Some(url.to_string()),
+            _ => cli_relay,
+        },
+    }
+}
+
 /// An outbound HTTP request the gateway should perform.
 pub struct HttpCall {
     pub method: String,
@@ -458,6 +486,52 @@ impl HttpClient for ReqwestHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_relay_precedence_is_shared_and_correct() {
+        // services-r3-03: the ONE tested precedence both binaries now call, so the gateway can no
+        // longer drift from the endpoint. Mirrors the endpoint's precedence test.
+        let default = || Some("wss://relay.hopme.sh/".to_string());
+
+        // 1. No CLI, no env: the default stands.
+        assert_eq!(resolve_relay(default(), false, None, None), default());
+        // 2. HOP_NO_RELAY truthy => degrade to no relay.
+        for v in ["1", "true", "yes"] {
+            assert_eq!(
+                resolve_relay(default(), false, Some(v), None),
+                None,
+                "HOP_NO_RELAY={v} degrades"
+            );
+        }
+        // 3. HOP_RELAY overrides the default; an empty value is ignored.
+        assert_eq!(
+            resolve_relay(default(), false, None, Some("wss://eu.relay/")),
+            Some("wss://eu.relay/".to_string())
+        );
+        assert_eq!(resolve_relay(default(), false, None, Some("")), default());
+        // HOP_NO_RELAY wins over HOP_RELAY.
+        assert_eq!(
+            resolve_relay(default(), false, Some("1"), Some("wss://eu.relay/")),
+            None,
+            "degrade wins over an explicit HOP_RELAY"
+        );
+        // 4. A CLI --relay/--no-relay ALWAYS wins; env is ignored entirely.
+        assert_eq!(
+            resolve_relay(
+                Some("wss://cli/".into()),
+                true,
+                Some("1"),
+                Some("wss://env/")
+            ),
+            Some("wss://cli/".to_string()),
+            "explicit --relay overrides even HOP_NO_RELAY"
+        );
+        assert_eq!(
+            resolve_relay(None, true, None, Some("wss://env/")),
+            None,
+            "explicit --no-relay overrides HOP_RELAY"
+        );
+    }
 
     struct FakeHttp;
     impl HttpClient for FakeHttp {
