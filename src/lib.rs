@@ -68,10 +68,30 @@ impl Allowlist {
     }
 }
 
-/// Extract the host (no scheme, no port, no path) from a URL.
+/// Extract the host (no scheme, no userinfo, no port, no path) from a URL.
+///
+/// services-01: this MUST strip userinfo before parsing the host. The naive
+/// `split(['/', '?', ':']).next()` returns the userinfo for `https://good.com:x@evil.com/` (it
+/// splits at the first `:`), so the allowlist would approve `good.com` while the fetch actually hits
+/// `evil.com`, an SSRF/allowlist-bypass primitive. We take the authority (up to the first path /
+/// query / fragment delimiter), drop anything up to and including the last `@` (userinfo), then trim
+/// a trailing `:port`. IPv6 literals (`[::1]`) keep their bracketed colons.
 fn host_of(url: &str) -> Option<&str> {
     let rest = url.split("://").nth(1)?;
-    rest.split(['/', '?', ':']).next().filter(|h| !h.is_empty())
+    // Authority ends at the first '/', '?', or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop userinfo: everything up to and including the LAST '@' in the authority.
+    let hostport = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    // Strip a trailing ":port". For an IPv6 literal keep everything inside the brackets.
+    let host = if let Some(end) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
+        &hostport[..=end] // includes the closing bracket; ignore any ":port" after it
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    Some(host).filter(|h| !h.is_empty())
 }
 
 impl EgressPolicy for Allowlist {
@@ -183,6 +203,14 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         let ttl = self.config.dedup_ttl_ms;
         self.fulfilled
             .retain(|_, &mut t| now_ms.saturating_sub(t) < ttl);
+        // services-12: bound the per-source rate map too. Without this it grows one entry per
+        // distinct source address forever (each source's vec is only pruned when THAT source is
+        // seen again). Drop any source whose most recent hit has aged out of the rate window.
+        let window = self.config.rate_window_ms;
+        self.rate.retain(|_, hits| {
+            hits.retain(|&t| now_ms.saturating_sub(t) < window);
+            !hits.is_empty()
+        });
         if self.fulfilled.contains_key(&request.id()) {
             return Ok(FulfillOutcome::Duplicate);
         }
@@ -398,6 +426,49 @@ mod tests {
     }
 
     #[test]
+    fn host_of_strips_userinfo_and_port() {
+        // services-01: userinfo must not be mistaken for the host, or the allowlist is bypassable.
+        assert_eq!(
+            host_of("https://good.com:x@evil.com/path"),
+            Some("evil.com")
+        );
+        assert_eq!(host_of("https://user:pass@evil.com"), Some("evil.com"));
+        assert_eq!(host_of("https://example.com:443/x"), Some("example.com"));
+        assert_eq!(host_of("https://example.com/a:b"), Some("example.com"));
+        assert_eq!(host_of("https://[::1]:8443/x"), Some("[::1]"));
+        assert_eq!(
+            host_of("https://api.example.com?q=1"),
+            Some("api.example.com")
+        );
+    }
+
+    #[test]
+    fn allowlist_is_not_bypassable_via_userinfo() {
+        // services-01: a crafted userinfo URL whose real host is off-allowlist must be denied.
+        let client = Identity::generate();
+        let policy = Allowlist::new(&["GET"], &["example.com"], true);
+        let mut gw = Gateway::new(Identity::generate(), FakeHttp, policy);
+        let gx = gw.address();
+        assert!(
+            matches!(
+                gw.fulfill(
+                    &request(
+                        &client,
+                        &gx,
+                        "GET",
+                        "https://example.com:x@evil.com/",
+                        vec![]
+                    ),
+                    0
+                )
+                .unwrap(),
+                FulfillOutcome::PolicyDenied
+            ),
+            "userinfo trick must not smuggle an off-allowlist host past the policy"
+        );
+    }
+
+    #[test]
     fn rejects_oversized_request_body() {
         let client = Identity::generate();
         let cfg = GatewayConfig {
@@ -416,6 +487,27 @@ mod tests {
             gw.fulfill(&req, 0).unwrap(),
             FulfillOutcome::RequestTooLarge
         ));
+    }
+
+    #[test]
+    fn rate_map_does_not_grow_unbounded_across_sources() {
+        // services-12: distinct sources whose activity has aged out must be dropped, not retained
+        // forever. After the window elapses, an unrelated request prunes the stale source entry.
+        let cfg = GatewayConfig {
+            rate_window_ms: 100,
+            ..Default::default()
+        };
+        let mut gw = Gateway::with_config(Identity::generate(), FakeHttp, AllowAll, cfg);
+        let gx = gw.address();
+        let s1 = Identity::generate();
+        gw.fulfill(&request(&s1, &gx, "GET", "https://a.com", vec![1]), 0)
+            .unwrap();
+        assert_eq!(gw.rate.len(), 1);
+        // A later request from a different source, past s1's window, prunes s1.
+        let s2 = Identity::generate();
+        gw.fulfill(&request(&s2, &gx, "GET", "https://a.com", vec![2]), 1_000)
+            .unwrap();
+        assert_eq!(gw.rate.len(), 1, "aged-out source dropped, not accumulated");
     }
 
     #[test]
