@@ -378,6 +378,15 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         self.rate.entry(src).or_default().push(now_ms);
         Screen::Allow
     }
+
+    /// services-r6-02: release the dedup record for a request that `screen()` Allowed but the caller
+    /// then could NOT perform (e.g. it was shed with a transient 503 at the in-flight fetch cap).
+    /// Without this, the Allow's dedup insert would make the client's retry of the SAME id a
+    /// `Duplicate`, so an explicitly-retryable 503 could never actually be retried. Only the dedup
+    /// entry is released; the rate-limit accounting stays, since the attempt was real.
+    pub fn forget(&mut self, id: BundleId) {
+        self.fulfilled.remove(&id);
+    }
 }
 
 /// The decision [`Gateway::screen`] returns for a decoded egress request. `Allow` means the caller
@@ -833,6 +842,39 @@ mod tests {
         assert_eq!(
             gw.screen(id(7), s, "GET", "https://example.com/", 0, 3),
             Screen::RateLimited
+        );
+    }
+
+    #[test]
+    fn forget_releases_dedup_so_a_503_shed_request_can_retry() {
+        // services-r6-02: screen() records the id for dedup on Allow, but the binary may then shed the
+        // request with a transient 503 at the in-flight fetch cap without performing it. forget() must
+        // release the dedup entry so the client's retry of the SAME id is screened afresh (Allow), not
+        // bounced as Duplicate. Without the fix, the second screen() below would return Duplicate.
+        let src = Identity::generate();
+        let policy = Allowlist::new(&["GET"], &["example.com"], true);
+        let mut gw = Gateway::new(Identity::generate(), FakeHttp, policy);
+        let s = src.address();
+        let mut id = [0u8; 32];
+        id[0] = 9;
+
+        // First screen: Allowed and recorded for dedup.
+        assert_eq!(
+            gw.screen(id, s, "GET", "https://example.com/", 0, 0),
+            Screen::Allow
+        );
+        // Simulate the binary shedding it with a 503 before the fetch: undo the dedup record.
+        gw.forget(id);
+        // The client's retry of the same id is now screened afresh, not a Duplicate.
+        assert_eq!(
+            gw.screen(id, s, "GET", "https://example.com/", 0, 1),
+            Screen::Allow,
+            "after forget(), a 503-shed request's retry is retryable, not Duplicate"
+        );
+        // And a genuine duplicate (no forget) is still deduped.
+        assert_eq!(
+            gw.screen(id, s, "GET", "https://example.com/", 0, 2),
+            Screen::Duplicate
         );
     }
 

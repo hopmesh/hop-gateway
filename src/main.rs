@@ -197,6 +197,20 @@ fn main() {
 }
 
 /// The driver: sole owner of the node + the gateway abuse-control state. Screens each decoded egress
+/// services-r6-01: run one core call under catch_unwind so a panic on attacker-controlled bundle bytes
+/// (decode/verify/open) becomes a logged skip instead of tearing down this always-on driver loop.
+/// Mirrors the endpoint's guard_core (the endpoint has 20 such sites; the gateway had none, so a single
+/// core panic here killed the whole gateway process). We do NOT log the offending bytes.
+fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!("hop-gateway: core panic in {what}; skipped (gateway stays up)");
+            None
+        }
+    }
+}
+
 /// request through the [`Gateway`], performs allowed fetches on worker threads (so a slow upstream
 /// never stalls the mesh loop), and seals responses.
 fn run(
@@ -213,21 +227,34 @@ fn run(
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(Ev::Up(link, role, out)) => {
                 writers.insert(link, out);
-                node.handle(BearerEvent::Connected(link, role));
+                guard_core("bearer-connected", || {
+                    node.handle(BearerEvent::Connected(link, role))
+                });
             }
-            Ok(Ev::Data(link, bytes)) => node.handle(BearerEvent::Data(link, bytes)),
+            Ok(Ev::Data(link, bytes)) => {
+                guard_core("bearer-data", || {
+                    node.handle(BearerEvent::Data(link, bytes))
+                });
+            }
             Ok(Ev::Down(link)) => {
                 writers.remove(&link);
-                node.handle(BearerEvent::Disconnected(link));
+                guard_core("bearer-disconnected", || {
+                    node.handle(BearerEvent::Disconnected(link))
+                });
             }
             Ok(Ev::Fetched(to, for_id, status, headers, body)) => {
-                let _ = node.send_http_response(to, for_id, status, headers, body);
+                guard_core("http-response", || {
+                    let _ = node.send_http_response(to, for_id, status, headers, body);
+                });
             }
-            Err(RecvTimeoutError::Timeout) => node.tick(now_ms()),
+            Err(RecvTimeoutError::Timeout) => {
+                guard_core("tick", || node.tick(now_ms()));
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        for r in node.take_http_requests() {
+        for r in guard_core("take-http-requests", || node.take_http_requests()).unwrap_or_default()
+        {
             let now = now_ms();
             let decision = gateway.screen(r.id, r.from, &r.method, &r.url, r.body.len(), now);
             if decision != Screen::Allow {
@@ -238,6 +265,10 @@ fn run(
             }
             if INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_FETCHES {
                 INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+                // services-r6-02: screen() Allowed this and recorded it for dedup, but we are shedding
+                // it here with a TRANSIENT, explicitly-retryable 503. Release the dedup record so the
+                // client's retry of the same id is screened afresh instead of bouncing as Duplicate.
+                gateway.forget(r.id);
                 let ct = vec![("content-type".to_string(), "text/plain".to_string())];
                 let _ = tx.send(Ev::Fetched(
                     r.from,
@@ -271,7 +302,9 @@ fn run(
             });
         }
 
-        for (link, bytes) in node.drain_outgoing() {
+        for (link, bytes) in
+            guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default()
+        {
             if let Some(out) = writers.get(&link) {
                 if out.send(bytes).is_err() {
                     writers.remove(&link);
