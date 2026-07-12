@@ -19,7 +19,7 @@ bs58 = "0.5"
 # redirects, and a streaming response cap. Optional so the trait-only lib stays lean.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 # The relay-dial bearer for the binary: a TLS WebSocket client (leaf reachable on the mesh, §30).
-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], optional = true }
 
 [features]
 # `reqwest` pulls the production HTTP client + the WebSocket bearer, which the binary requires. The

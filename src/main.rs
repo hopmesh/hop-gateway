@@ -369,7 +369,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                 'conn: loop {
                     loop {
                         match out_rx.try_recv() {
-                            Ok(bytes) => match ws.write(Message::Binary(bytes)) {
+                            Ok(bytes) => match ws.write(Message::Binary(bytes.into())) {
                                 Ok(()) => {}
                                 Err(tungstenite::Error::Io(e))
                                     if e.kind() == std::io::ErrorKind::WouldBlock => {}
