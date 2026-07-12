@@ -201,6 +201,14 @@ fn main() {
 /// (decode/verify/open) becomes a logged skip instead of tearing down this always-on driver loop.
 /// Mirrors the endpoint's guard_core (the endpoint has 20 such sites; the gateway had none, so a single
 /// core panic here killed the whole gateway process). We do NOT log the offending bytes.
+///
+/// F-18d (pass-18 audit): this wraps a WHOLE core call, not the individual `self.*` mutations
+/// inside one `on_bundle` match arm. That is deliberate: `Node`'s state is plain safe-Rust
+/// `HashMap`/`Vec` (memory-safe regardless of where a panic lands). See the longer
+/// note on `hop-relayd`'s `guard_core` (`services/hop-relayd/src/main.rs`) for the full
+/// audit trail: no reachable mid-arm panic was found beyond one already-fixed case, and the
+/// riskiest arm (`Payload::HpsRekey`) was reordered to fail-safe (install-then-remove) and is
+/// enforced by `hop_core::node::tests::hps_rekey_install_before_remove_survives_a_mid_arm_panic`.
 fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
