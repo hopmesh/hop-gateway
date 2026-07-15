@@ -436,6 +436,40 @@ impl Default for ReqwestHttpClient {
 }
 
 #[cfg(feature = "reqwest")]
+fn sanitized_request_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    let connection_named: std::collections::HashSet<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            !connection_named.contains(&name)
+                && !matches!(
+                    name.as_str(),
+                    "host"
+                        | "connection"
+                        | "keep-alive"
+                        | "proxy-authenticate"
+                        | "proxy-authorization"
+                        | "proxy-connection"
+                        | "te"
+                        | "trailer"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "forwarded"
+                )
+                && !name.starts_with("x-forwarded-")
+        })
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+#[cfg(feature = "reqwest")]
 impl HttpClient for ReqwestHttpClient {
     fn perform(&self, call: HttpCall) -> HttpResult {
         use std::io::Read;
@@ -450,8 +484,8 @@ impl HttpClient for ReqwestHttpClient {
             }
         };
         let mut req = self.http.request(method, &call.url);
-        for (k, v) in &call.headers {
-            req = req.header(k.as_str(), v.as_str());
+        for (k, v) in sanitized_request_headers(&call.headers) {
+            req = req.header(k, v);
         }
         if !call.body.is_empty() {
             req = req.body(call.body);
@@ -495,6 +529,74 @@ impl HttpClient for ReqwestHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn production_client_derives_host_and_strips_hop_by_hop_headers() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let url = format!("http://{authority}/headers");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = Vec::new();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                }
+            }
+            tx.send(headers).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let result = ReqwestHttpClient::default().perform(HttpCall {
+            method: "GET".into(),
+            url,
+            headers: vec![
+                ("Host".into(), "internal.invalid".into()),
+                ("Connection".into(), "x-secret".into()),
+                ("X-Secret".into(), "remove-me".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("X-Forwarded-Host".into(), "internal.invalid".into()),
+                ("X-End-To-End".into(), "keep-me".into()),
+            ],
+            body: vec![],
+            max_resp_bytes: 1024,
+        });
+        assert_eq!(result.status, 204);
+        let headers = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            headers.iter().find(|(name, _)| name == "host").unwrap().1,
+            authority
+        );
+        for forbidden in [
+            "connection",
+            "x-secret",
+            "transfer-encoding",
+            "x-forwarded-host",
+        ] {
+            assert!(!headers.iter().any(|(name, _)| name == forbidden));
+        }
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-end-to-end" && value == "keep-me"));
+    }
 
     #[test]
     fn resolve_relay_precedence_is_shared_and_correct() {
