@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-repository = "https://github.com/hopmesh/hop"
+repository = "https://github.com/hopmesh/monorepo"
 
 [workspace.dependencies]
 hop-core = { version = "0.0.1", package = "hop-mesh-core" }
@@ -42,6 +42,7 @@ required-features = ["reqwest"]
 [dependencies]
 hop-core.workspace = true
 bs58 = "0.5"
+url = "2"
 # The production egress HTTP client (services-02): blocking reqwest with connect/read timeouts, no
 # redirects, and a streaming response cap. Optional so the trait-only lib stays lean.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }

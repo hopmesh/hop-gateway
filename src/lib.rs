@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use hop_core::prelude::*;
+use url::{Host, Url};
 
 /// services-r3-03: the ONE shared, tested graceful-degrade precedence for resolving the relay
 /// endpoint from (CLI, `HOP_NO_RELAY`, `HOP_RELAY`). Both the `hop-gateway` and `hop-endpoint`
@@ -55,7 +56,7 @@ pub fn resolve_relay(
 /// An outbound HTTP request the gateway should perform.
 pub struct HttpCall {
     pub method: String,
-    pub url: String,
+    pub url: Url,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub max_resp_bytes: u32,
@@ -76,7 +77,7 @@ pub trait HttpClient {
 
 /// Policy gate for which requests a gateway is willing to make (DESIGN.md §9).
 pub trait EgressPolicy {
-    fn allows(&self, method: &str, url: &str) -> bool;
+    fn allows(&self, method: &str, url: &Url) -> bool;
 }
 
 /// A placeholder [`HttpClient`] that never performs a request (returns 500). Used when a caller
@@ -97,7 +98,7 @@ impl HttpClient for NoHttpClient {
 /// Permit everything — for tests/dev only. Production ships an [`Allowlist`].
 pub struct AllowAll;
 impl EgressPolicy for AllowAll {
-    fn allows(&self, _method: &str, _url: &str) -> bool {
+    fn allows(&self, _method: &str, _url: &Url) -> bool {
         true
     }
 }
@@ -106,7 +107,7 @@ impl EgressPolicy for AllowAll {
 /// only hosts matching one of the suffixes (exact or `*.suffix`).
 pub struct Allowlist {
     pub methods: Vec<String>,
-    pub host_suffixes: Vec<String>,
+    host_suffixes: Vec<String>,
     pub https_only: bool,
 }
 
@@ -114,53 +115,66 @@ impl Allowlist {
     pub fn new(methods: &[&str], host_suffixes: &[&str], https_only: bool) -> Self {
         Self {
             methods: methods.iter().map(|m| m.to_string()).collect(),
-            host_suffixes: host_suffixes.iter().map(|h| h.to_string()).collect(),
+            host_suffixes: host_suffixes
+                .iter()
+                .filter_map(|host| canonical_allowlist_host(host))
+                .collect(),
             https_only,
         }
     }
 }
 
-/// Extract the host (no scheme, no userinfo, no port, no path) from a URL.
-///
-/// services-01: this MUST strip userinfo before parsing the host. The naive
-/// `split(['/', '?', ':']).next()` returns the userinfo for `https://good.com:x@evil.com/` (it
-/// splits at the first `:`), so the allowlist would approve `good.com` while the fetch actually hits
-/// `evil.com`, an SSRF/allowlist-bypass primitive. We take the authority (up to the first path /
-/// query / fragment delimiter), drop anything up to and including the last `@` (userinfo), then trim
-/// a trailing `:port`. IPv6 literals (`[::1]`) keep their bracketed colons.
-fn host_of(url: &str) -> Option<&str> {
-    let rest = url.split("://").nth(1)?;
-    // Authority ends at the first '/', '?', or '#'.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Drop userinfo: everything up to and including the LAST '@' in the authority.
-    let hostport = match authority.rfind('@') {
-        Some(i) => &authority[i + 1..],
-        None => authority,
-    };
-    // Strip a trailing ":port". For an IPv6 literal keep everything inside the brackets.
-    let host = if let Some(end) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
-        &hostport[..=end] // includes the closing bracket; ignore any ":port" after it
-    } else {
-        hostport.split(':').next().unwrap_or(hostport)
-    };
-    Some(host).filter(|h| !h.is_empty())
+fn canonical_allowlist_host(host: &str) -> Option<String> {
+    let parsed = Url::parse(&format!("https://{host}/")).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    parsed.host_str().map(str::to_string)
+}
+
+/// Parse an attacker-controlled outbound URL exactly once with the WHATWG parser reqwest uses.
+/// Every later policy and transport decision receives this same value.
+fn parse_outbound_url(raw: &str) -> Option<Url> {
+    if raw.contains('\\') || raw.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    Some(url)
 }
 
 impl EgressPolicy for Allowlist {
-    fn allows(&self, method: &str, url: &str) -> bool {
+    fn allows(&self, method: &str, url: &Url) -> bool {
         if !self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
             return false;
         }
-        if self.https_only && !url.starts_with("https://") {
+        if (self.https_only && url.scheme() != "https") || !matches!(url.scheme(), "http" | "https")
+        {
             return false;
         }
-        match host_of(url) {
-            Some(host) => self
-                .host_suffixes
-                .iter()
-                .any(|s| host == s || host.ends_with(&format!(".{s}"))),
-            None => false,
-        }
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        self.host_suffixes.iter().any(|suffix| {
+            host == suffix
+                || (matches!(url.host(), Some(Host::Domain(_)))
+                    && host
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('.')))
+        })
     }
 }
 
@@ -282,6 +296,9 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         if body.len() > self.config.max_request_bytes {
             return Ok(FulfillOutcome::RequestTooLarge);
         }
+        let Some(url) = parse_outbound_url(&url) else {
+            return Ok(FulfillOutcome::PolicyDenied);
+        };
         if !self.policy.allows(&method, &url) {
             return Ok(FulfillOutcome::PolicyDenied);
         }
@@ -367,7 +384,10 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         if body_len > self.config.max_request_bytes {
             return Screen::RequestTooLarge;
         }
-        if !self.policy.allows(method, url) {
+        let Some(url) = parse_outbound_url(url) else {
+            return Screen::PolicyDenied;
+        };
+        if !self.policy.allows(method, &url) {
             return Screen::PolicyDenied;
         }
         if self.is_rate_limited(src, now_ms) {
@@ -376,7 +396,7 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         // Accepted: record for dedup + rate accounting, then let the caller perform the fetch.
         self.fulfilled.insert(id, now_ms);
         self.rate.entry(src).or_default().push(now_ms);
-        Screen::Allow
+        Screen::Allow(url)
     }
 
     /// services-r6-02: release the dedup record for a request that `screen()` Allowed but the caller
@@ -392,9 +412,9 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
 /// The decision [`Gateway::screen`] returns for a decoded egress request. `Allow` means the caller
 /// should perform the fetch and route the response; every other variant is a rejection the caller
 /// turns into an error response (or drops).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Screen {
-    Allow,
+    Allow(Url),
     Duplicate,
     RateLimited,
     PolicyDenied,
@@ -411,6 +431,26 @@ pub struct ReqwestHttpClient {
 }
 
 #[cfg(feature = "reqwest")]
+pub const HTTP_RESPONSE_METADATA_RESERVATION_BYTES: usize = 64 * 1024;
+#[cfg(feature = "reqwest")]
+const HTTP_RESPONSE_READ_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Reservation seam used by the production binary to charge the shared driver byte budget before
+/// this client allocates or grows a response body.
+#[cfg(feature = "reqwest")]
+pub trait ResponseReservation {
+    fn bytes(&self) -> usize;
+    fn grow_to(&mut self, bytes: usize, timeout: std::time::Duration) -> bool;
+    fn shrink_to(&mut self, bytes: usize);
+}
+
+#[cfg(feature = "reqwest")]
+pub enum BudgetedHttpResult<R> {
+    Complete { result: HttpResult, reservation: R },
+    BudgetRejected(R),
+}
+
+#[cfg(feature = "reqwest")]
 impl ReqwestHttpClient {
     /// Build a client with a total request `timeout` and a separate `connect_timeout`. Redirects are
     /// disabled (an egress fetch must hit exactly the allowlisted URL, never a redirect target).
@@ -422,6 +462,111 @@ impl ReqwestHttpClient {
             .build()
             .expect("build reqwest client");
         Self { http }
+    }
+
+    pub fn perform_reserved<R: ResponseReservation>(
+        &self,
+        call: HttpCall,
+        mut reservation: R,
+        reservation_timeout: std::time::Duration,
+    ) -> BudgetedHttpResult<R> {
+        use std::io::Read;
+
+        let method = match reqwest::Method::from_bytes(call.method.as_bytes()) {
+            Ok(method) => method,
+            Err(_) => {
+                return BudgetedHttpResult::Complete {
+                    result: HttpResult {
+                        status: 400,
+                        headers: vec![],
+                        body: b"hop-gateway: bad method".to_vec(),
+                    },
+                    reservation,
+                }
+            }
+        };
+        let mut request = self.http.request(method, call.url);
+        for (name, value) in sanitized_request_headers(&call.headers) {
+            request = request.header(name, value);
+        }
+        if !call.body.is_empty() {
+            request = request.body(call.body);
+        }
+        let mut response = match request.send() {
+            Ok(response) => response,
+            Err(_) => {
+                return BudgetedHttpResult::Complete {
+                    result: HttpResult {
+                        status: 502,
+                        headers: vec![],
+                        body: b"hop-gateway: upstream unreachable".to_vec(),
+                    },
+                    reservation,
+                }
+            }
+        };
+        let status = response.status().as_u16();
+        let mut header_bytes = 0usize;
+        let mut headers = Vec::new();
+        for (name, value) in response.headers() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            let bytes = name.as_str().len().saturating_add(value.len());
+            if header_bytes.saturating_add(bytes) > HTTP_RESPONSE_METADATA_RESERVATION_BYTES {
+                break;
+            }
+            header_bytes += bytes;
+            headers.push((name.as_str().to_string(), value.to_string()));
+        }
+
+        let cap = call.max_resp_bytes as usize;
+        let hinted = response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .map(|length| length.min(cap))
+            .unwrap_or(cap);
+        let metadata = HTTP_RESPONSE_METADATA_RESERVATION_BYTES;
+        if !reservation.grow_to(metadata.saturating_add(hinted), reservation_timeout) {
+            return BudgetedHttpResult::BudgetRejected(reservation);
+        }
+
+        let mut body = Vec::new();
+        let mut chunk = [0u8; HTTP_RESPONSE_READ_CHUNK_BYTES];
+        while body.len() < cap {
+            let allowance = (cap - body.len()).min(chunk.len());
+            let read = match response.read(&mut chunk[..allowance]) {
+                Ok(read) => read,
+                Err(_) => {
+                    return BudgetedHttpResult::Complete {
+                        result: HttpResult {
+                            status: 502,
+                            headers: vec![],
+                            body: b"hop-gateway: upstream response failed".to_vec(),
+                        },
+                        reservation,
+                    }
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            let next = metadata.saturating_add(body.len()).saturating_add(read);
+            if next > reservation.bytes() && !reservation.grow_to(next, reservation_timeout) {
+                return BudgetedHttpResult::BudgetRejected(reservation);
+            }
+            body.reserve_exact(read);
+            body.extend_from_slice(&chunk[..read]);
+        }
+        reservation.shrink_to(header_bytes.saturating_add(body.len()).saturating_add(80));
+        BudgetedHttpResult::Complete {
+            result: HttpResult {
+                status,
+                headers,
+                body,
+            },
+            reservation,
+        }
     }
 }
 
@@ -472,56 +617,26 @@ fn sanitized_request_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> 
 #[cfg(feature = "reqwest")]
 impl HttpClient for ReqwestHttpClient {
     fn perform(&self, call: HttpCall) -> HttpResult {
-        use std::io::Read;
-        let method = match reqwest::Method::from_bytes(call.method.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                return HttpResult {
-                    status: 400,
-                    headers: vec![],
-                    body: b"hop-gateway: bad method".to_vec(),
-                }
+        struct UnboundedReservation(usize);
+        impl ResponseReservation for UnboundedReservation {
+            fn bytes(&self) -> usize {
+                self.0
             }
-        };
-        let mut req = self.http.request(method, &call.url);
-        for (k, v) in sanitized_request_headers(&call.headers) {
-            req = req.header(k, v);
-        }
-        if !call.body.is_empty() {
-            req = req.body(call.body);
-        }
-        let mut resp = match req.send() {
-            Ok(r) => r,
-            Err(_) => {
-                return HttpResult {
-                    status: 502,
-                    headers: vec![],
-                    body: b"hop-gateway: upstream unreachable".to_vec(),
-                }
+            fn grow_to(&mut self, bytes: usize, _timeout: std::time::Duration) -> bool {
+                self.0 = bytes;
+                true
             }
-        };
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|v| (k.as_str().to_string(), v.to_string()))
-            })
-            .collect();
-        // Stream the body with a hard cap: read at most max_resp_bytes+1 and truncate, so an
-        // endless/oversized response can't exhaust memory (the +1 lets the gateway note truncation
-        // if it ever wants to; here we simply cap).
-        let cap = call.max_resp_bytes as usize;
-        let mut body = Vec::new();
-        let mut limited = (&mut resp).take(cap as u64 + 1);
-        let _ = limited.read_to_end(&mut body);
-        body.truncate(cap);
-        HttpResult {
-            status,
-            headers,
-            body,
+            fn shrink_to(&mut self, bytes: usize) {
+                self.0 = bytes;
+            }
+        }
+        match self.perform_reserved(call, UnboundedReservation(0), std::time::Duration::ZERO) {
+            BudgetedHttpResult::Complete { result, .. } => result,
+            BudgetedHttpResult::BudgetRejected(_) => HttpResult {
+                status: 503,
+                headers: vec![],
+                body: b"hop-gateway: response budget saturated".to_vec(),
+            },
         }
     }
 }
@@ -567,7 +682,7 @@ mod tests {
 
         let result = ReqwestHttpClient::default().perform(HttpCall {
             method: "GET".into(),
-            url,
+            url: Url::parse(&url).unwrap(),
             headers: vec![
                 ("Host".into(), "internal.invalid".into()),
                 ("Connection".into(), "x-secret".into()),
@@ -596,6 +711,159 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(name, value)| name == "x-end-to-end" && value == "keep-me"));
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn production_client_does_not_follow_redirects() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/private", redirect_target.local_addr().unwrap());
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_url =
+            Url::parse(&format!("http://{}/start", origin.local_addr().unwrap())).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut first_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut first_line)
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let result = ReqwestHttpClient::default().perform(HttpCall {
+            method: "GET".into(),
+            url: origin_url,
+            headers: vec![],
+            body: vec![],
+            max_resp_bytes: 1024,
+        });
+        assert_eq!(result.status, 302);
+        assert!(matches!(
+            redirect_target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn production_client_reserves_absent_and_oversized_content_lengths_before_body_allocation() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        #[derive(Default)]
+        struct TrackingReservation {
+            bytes: usize,
+            peak: usize,
+        }
+        impl ResponseReservation for TrackingReservation {
+            fn bytes(&self) -> usize {
+                self.bytes
+            }
+            fn grow_to(&mut self, bytes: usize, _timeout: std::time::Duration) -> bool {
+                self.bytes = bytes;
+                self.peak = self.peak.max(bytes);
+                true
+            }
+            fn shrink_to(&mut self, bytes: usize) {
+                self.bytes = bytes;
+            }
+        }
+
+        fn serve(response: Vec<u8>) -> Url {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url =
+                Url::parse(&format!("http://{}/body", listener.local_addr().unwrap())).unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+            });
+            url
+        }
+
+        let body = vec![b'x'; 100];
+        let mut chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n64\r\n"
+                .to_vec();
+        chunked.extend_from_slice(&body);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let result = ReqwestHttpClient::default().perform_reserved(
+            HttpCall {
+                method: "GET".into(),
+                url: serve(chunked),
+                headers: vec![],
+                body: vec![],
+                max_resp_bytes: 100,
+            },
+            TrackingReservation {
+                bytes: HTTP_RESPONSE_METADATA_RESERVATION_BYTES,
+                peak: HTTP_RESPONSE_METADATA_RESERVATION_BYTES,
+            },
+            std::time::Duration::from_secs(1),
+        );
+        let BudgetedHttpResult::Complete {
+            result,
+            reservation,
+        } = result
+        else {
+            panic!("chunked response should fit its pre-reserved maximum")
+        };
+        assert_eq!(result.body.len(), 100);
+        assert_eq!(
+            reservation.peak,
+            HTTP_RESPONSE_METADATA_RESERVATION_BYTES + 100,
+            "absent/chunked Content-Length reserves the configured maximum before reading"
+        );
+
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{}",
+            "y".repeat(1000)
+        )
+        .into_bytes();
+        let result = ReqwestHttpClient::default().perform_reserved(
+            HttpCall {
+                method: "GET".into(),
+                url: serve(oversized),
+                headers: vec![],
+                body: vec![],
+                max_resp_bytes: 100,
+            },
+            TrackingReservation {
+                bytes: HTTP_RESPONSE_METADATA_RESERVATION_BYTES,
+                peak: HTTP_RESPONSE_METADATA_RESERVATION_BYTES,
+            },
+            std::time::Duration::from_secs(1),
+        );
+        let BudgetedHttpResult::Complete {
+            result,
+            reservation,
+        } = result
+        else {
+            panic!("capped response should fit")
+        };
+        assert_eq!(result.body.len(), 100);
+        assert_eq!(
+            reservation.peak,
+            HTTP_RESPONSE_METADATA_RESERVATION_BYTES + 100,
+            "an oversized declared length is capped before allocation"
+        );
     }
 
     #[test]
@@ -651,6 +919,20 @@ mod tests {
                 status: 200,
                 headers: vec![("content-type".into(), "text/plain".into())],
                 body: b"hello from the internet".to_vec(),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingHttp(std::sync::Arc<std::sync::Mutex<Vec<Url>>>);
+
+    impl HttpClient for CapturingHttp {
+        fn perform(&self, call: HttpCall) -> HttpResult {
+            self.0.lock().unwrap().push(call.url);
+            HttpResult {
+                status: 204,
+                headers: vec![],
+                body: vec![],
             }
         }
     }
@@ -783,20 +1065,132 @@ mod tests {
     }
 
     #[test]
-    fn host_of_strips_userinfo_and_port() {
-        // services-01: userinfo must not be mistaken for the host, or the allowlist is bypassable.
-        assert_eq!(
-            host_of("https://good.com:x@evil.com/path"),
-            Some("evil.com")
+    fn policy_and_http_client_share_one_canonical_url() {
+        let client = Identity::generate();
+        let capture = CapturingHttp::default();
+        let seen = capture.0.clone();
+        let policy = Allowlist::new(
+            &["GET"],
+            &[
+                "example.com",
+                "b\u{00fc}cher.example",
+                "127.0.0.1",
+                "[2001:db8::1]",
+            ],
+            true,
         );
-        assert_eq!(host_of("https://user:pass@evil.com"), Some("evil.com"));
-        assert_eq!(host_of("https://example.com:443/x"), Some("example.com"));
-        assert_eq!(host_of("https://example.com/a:b"), Some("example.com"));
-        assert_eq!(host_of("https://[::1]:8443/x"), Some("[::1]"));
-        assert_eq!(
-            host_of("https://api.example.com?q=1"),
-            Some("api.example.com")
-        );
+        let mut gateway = Gateway::new(Identity::generate(), capture, policy);
+        let address = gateway.address();
+        let allowed = [
+            ("HTTPS://EXAMPLE.COM/a/../ok", "example.com", None, "/ok"),
+            (
+                "https://api.example.com:443/a%2Fb",
+                "api.example.com",
+                None,
+                "/a%2Fb",
+            ),
+            ("https://example.com:8443/", "example.com", Some(8443), "/"),
+            (
+                "https://b\u{00fc}cher.example/",
+                "xn--bcher-kva.example",
+                None,
+                "/",
+            ),
+            (
+                "https://xn--bcher-kva.example/",
+                "xn--bcher-kva.example",
+                None,
+                "/",
+            ),
+            ("https://127.1/", "127.0.0.1", None, "/"),
+            ("https://[2001:db8::1]/", "[2001:db8::1]", None, "/"),
+        ];
+
+        for (index, (raw, _, _, _)) in allowed.iter().enumerate() {
+            assert!(matches!(
+                gateway
+                    .fulfill(
+                        &request(&client, &address, "GET", raw, vec![index as u8]),
+                        index as u64
+                    )
+                    .unwrap(),
+                FulfillOutcome::Response(_)
+            ));
+        }
+
+        let captured = seen.lock().unwrap();
+        assert_eq!(captured.len(), allowed.len());
+        for (actual, (_, host, port, path)) in captured.iter().zip(allowed) {
+            assert_eq!(actual.host_str(), Some(host));
+            assert_eq!(actual.port(), port);
+            assert_eq!(actual.path(), path);
+        }
+        drop(captured);
+
+        for (index, raw) in [
+            "http://example.com/",
+            "https://example.com.evil.test/",
+            "https://notexample.com/",
+            "https://example.com\\@evil.test/",
+            "https://example.com%2fevil.test/",
+            "https://user@example.com/",
+            "https://user:pass@example.com/",
+            "https://example.com/#secret",
+            "ftp://example.com/file",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                gateway
+                    .fulfill(
+                        &request(&client, &address, "GET", raw, vec![0x80 | index as u8]),
+                        100 + index as u64
+                    )
+                    .unwrap(),
+                FulfillOutcome::PolicyDenied
+            ));
+        }
+        assert_eq!(seen.lock().unwrap().len(), allowed.len());
+    }
+
+    #[test]
+    fn outbound_url_parser_uses_canonical_url_semantics() {
+        let cases = [
+            ("HTTPS://EXAMPLE.COM/a/../ok", Some(("example.com", "/ok"))),
+            (
+                "https://b\u{00fc}cher.example/catalog",
+                Some(("xn--bcher-kva.example", "/catalog")),
+            ),
+            (
+                "https://xn--bcher-kva.example/",
+                Some(("xn--bcher-kva.example", "/")),
+            ),
+            ("https://127.1/", Some(("127.0.0.1", "/"))),
+            (
+                "https://[2001:db8::1]:8443/a%2Fb",
+                Some(("[2001:db8::1]", "/a%2Fb")),
+            ),
+            ("https://example.com:443/", Some(("example.com", "/"))),
+            ("https://example.com:8443/", Some(("example.com", "/"))),
+            ("https://example.com\\@evil.test/", None),
+            ("https://example.com%2fevil.test/", None),
+            ("https://user@example.com/", None),
+            ("https://example.com/#fragment", None),
+            ("file:///etc/passwd", None),
+        ];
+
+        for (raw, expected) in cases {
+            let parsed = parse_outbound_url(raw);
+            match expected {
+                Some((host, path)) => {
+                    let parsed = parsed.unwrap_or_else(|| panic!("expected URL to parse: {raw}"));
+                    assert_eq!(parsed.host_str(), Some(host), "host for {raw}");
+                    assert_eq!(parsed.path(), path, "path for {raw}");
+                }
+                None => assert!(parsed.is_none(), "expected URL rejection: {raw}"),
+            }
+        }
     }
 
     #[test]
@@ -928,19 +1322,19 @@ mod tests {
             Screen::RequestTooLarge
         );
         // Allowed, and recorded: a duplicate id is then rejected.
-        assert_eq!(
+        assert!(matches!(
             gw.screen(id(5), s, "GET", "https://example.com/", 0, 0),
-            Screen::Allow
-        );
+            Screen::Allow(_)
+        ));
         assert_eq!(
             gw.screen(id(5), s, "GET", "https://example.com/", 0, 1),
             Screen::Duplicate
         );
         // Rate limit: budget is 2/window; id(5) counted as 1, this is 2 (ok), the next is shed.
-        assert_eq!(
+        assert!(matches!(
             gw.screen(id(6), s, "GET", "https://example.com/", 0, 2),
-            Screen::Allow
-        );
+            Screen::Allow(_)
+        ));
         assert_eq!(
             gw.screen(id(7), s, "GET", "https://example.com/", 0, 3),
             Screen::RateLimited
@@ -961,16 +1355,18 @@ mod tests {
         id[0] = 9;
 
         // First screen: Allowed and recorded for dedup.
-        assert_eq!(
+        assert!(matches!(
             gw.screen(id, s, "GET", "https://example.com/", 0, 0),
-            Screen::Allow
-        );
+            Screen::Allow(_)
+        ));
         // Simulate the binary shedding it with a 503 before the fetch: undo the dedup record.
         gw.forget(id);
         // The client's retry of the same id is now screened afresh, not a Duplicate.
-        assert_eq!(
-            gw.screen(id, s, "GET", "https://example.com/", 0, 1),
-            Screen::Allow,
+        assert!(
+            matches!(
+                gw.screen(id, s, "GET", "https://example.com/", 0, 1),
+                Screen::Allow(_)
+            ),
             "after forget(), a 503-shed request's retry is retryable, not Duplicate"
         );
         // And a genuine duplicate (no forget) is still deduped.

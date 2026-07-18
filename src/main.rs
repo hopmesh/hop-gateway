@@ -26,17 +26,33 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hop_core::admission::{
+    byte_channel, ByteReceiver, ByteReservation, ByteSender, QueueAdmissionError, QueueLimits,
+};
 use hop_core::prelude::*;
 use hop_gateway::{
-    resolve_relay, Allowlist, Gateway, HttpCall, HttpClient, NoHttpClient, ReqwestHttpClient,
-    Screen,
+    resolve_relay, Allowlist, BudgetedHttpResult, Gateway, HttpCall, NoHttpClient,
+    ReqwestHttpClient, ResponseReservation, Screen, HTTP_RESPONSE_METADATA_RESERVATION_BYTES,
 };
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
+
+const MAX_FRAME_BYTES: usize = 1 << 20;
+const MAX_FETCH_BODY_BYTES: u32 = 16 * 1024 * 1024;
+const MAX_EVENT_QUEUE_EVENTS: usize = 256;
+const MAX_EVENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = MAX_FETCH_BODY_BYTES as usize + 64 * 1024;
+const MAX_EVENT_SOURCE_EVENTS: usize = 32;
+const MAX_EVENT_SOURCE_BYTES: usize = MAX_EVENT_BYTES;
+const MAX_EVENT_BATCH: usize = 32;
+const DRIVER_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_OUTBOUND_FRAMES_PER_LINK: usize = 32;
+const FETCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// services-02: cap concurrent backend fetches so a burst of mesh egress requests (which have no
 /// TCP-side IP limiter) can't exhaust threads/memory. Over the cap a request is shed with a 503.
@@ -74,11 +90,146 @@ fn reconnect_backoff(failures: u32) -> Duration {
 
 /// Driver events: bearer lifecycle + a completed backend fetch handed back from a worker.
 enum Ev {
-    Up(u64, Role, Sender<Vec<u8>>),
+    Up(u64, Role, SyncSender<Vec<u8>>),
     Data(u64, Vec<u8>),
     Down(u64),
     /// A finished fetch: (to, for_request_id, status, headers, body).
     Fetched(PubKeyBytes, BundleId, u16, Vec<(String, String)>, Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EventSource {
+    Link(u64),
+    Peer(PubKeyBytes),
+}
+
+impl Ev {
+    fn admission(&self) -> (EventSource, usize) {
+        match self {
+            Self::Up(link, _, _) | Self::Down(link) => (EventSource::Link(*link), 1),
+            Self::Data(link, bytes) => (EventSource::Link(*link), bytes.len()),
+            Self::Fetched(to, _, _, headers, body) => {
+                let header_bytes = headers.iter().fold(0usize, |total, (name, value)| {
+                    total.saturating_add(name.len()).saturating_add(value.len())
+                });
+                (
+                    EventSource::Peer(*to),
+                    body.len().saturating_add(header_bytes).saturating_add(80),
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EventTx(ByteSender<Ev, EventSource>);
+
+impl EventTx {
+    fn send(&self, event: Ev) -> std::result::Result<(), QueueAdmissionError> {
+        let (source, bytes) = event.admission();
+        self.0.send(source, bytes, event)
+    }
+
+    #[cfg(test)]
+    fn try_send(&self, event: Ev) -> std::result::Result<(), QueueAdmissionError> {
+        let (source, bytes) = event.admission();
+        self.0.try_send(source, bytes, event)
+    }
+
+    fn try_reserve_fetched(
+        &self,
+        peer: PubKeyBytes,
+        body_cap: u32,
+    ) -> std::result::Result<FetchReservation, QueueAdmissionError> {
+        self.0
+            .try_reserve(
+                EventSource::Peer(peer),
+                HTTP_RESPONSE_METADATA_RESERVATION_BYTES.saturating_add(body_cap as usize),
+            )
+            .map(FetchReservation)
+    }
+
+    fn send_reserved(
+        &self,
+        mut reservation: FetchReservation,
+        event: Ev,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        let (_, bytes) = event.admission();
+        if bytes > reservation.0.bytes() {
+            reservation.0.grow_to(bytes, FETCH_RESERVATION_TIMEOUT)?;
+        } else {
+            reservation.0.shrink_to(bytes);
+        }
+        reservation.0.send(event)
+    }
+
+    fn reserve_frame(
+        &self,
+        link: u64,
+    ) -> std::result::Result<ByteReservation<Ev, EventSource>, QueueAdmissionError> {
+        self.0.reserve_timeout(
+            EventSource::Link(link),
+            MAX_FRAME_BYTES,
+            FRAME_RESERVATION_TIMEOUT,
+        )
+    }
+
+    fn send_reserved_frame(
+        &self,
+        mut reservation: ByteReservation<Ev, EventSource>,
+        link: u64,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(QueueAdmissionError::EventTooLarge);
+        }
+        reservation.shrink_to(bytes.len());
+        reservation.try_send(Ev::Data(link, bytes))
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize) {
+        self.0.usage()
+    }
+}
+
+struct FetchReservation(ByteReservation<Ev, EventSource>);
+
+impl ResponseReservation for FetchReservation {
+    fn bytes(&self) -> usize {
+        self.0.bytes()
+    }
+
+    fn grow_to(&mut self, bytes: usize, timeout: Duration) -> bool {
+        self.0.grow_to(bytes, timeout).is_ok()
+    }
+
+    fn shrink_to(&mut self, bytes: usize) {
+        self.0.shrink_to(bytes);
+    }
+}
+
+struct EventRx(ByteReceiver<Ev, EventSource>);
+
+impl EventRx {
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Ev, RecvTimeoutError> {
+        self.0.recv_timeout(timeout)
+    }
+
+    fn try_recv(&self) -> std::result::Result<Ev, mpsc::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+fn event_channel() -> (EventTx, EventRx) {
+    let (tx, rx) = byte_channel(QueueLimits {
+        max_events: MAX_EVENT_QUEUE_EVENTS,
+        max_bytes: MAX_EVENT_QUEUE_BYTES,
+        max_event_bytes: MAX_EVENT_BYTES,
+        max_source_events: MAX_EVENT_SOURCE_EVENTS,
+        max_source_bytes: MAX_EVENT_SOURCE_BYTES,
+    });
+    (EventTx(tx), EventRx(rx))
 }
 
 fn now_ms() -> u64 {
@@ -122,7 +273,13 @@ fn main() {
                 }
             }
             "--allow-insecure" => https_only = false,
-            "--max-resp" => max_resp = args.next().and_then(|s| s.parse().ok()).unwrap_or(max_resp),
+            "--max-resp" => {
+                max_resp = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_resp)
+                    .min(MAX_FETCH_BODY_BYTES)
+            }
             "--healthz" => healthz = args.next(),
             "--print-address" => print_address = true,
             other => eprintln!("ignoring unknown arg: {other}"),
@@ -173,7 +330,7 @@ fn main() {
     node.set_kind(NodeKind::Gateway);
     node.set_max_relayed(0); // a leaf: never carries others' traffic
 
-    let (tx, rx) = mpsc::channel::<Ev>();
+    let (tx, rx) = event_channel();
 
     // Optional /healthz listener (for a container liveness probe).
     if let Some(hz) = healthz {
@@ -226,51 +383,32 @@ fn run(
     gateway: &mut Gateway<NoHttpClient, Allowlist>,
     client: std::sync::Arc<ReqwestHttpClient>,
     max_resp: u32,
-    tx: Sender<Ev>,
-    rx: mpsc::Receiver<Ev>,
+    tx: EventTx,
+    rx: EventRx,
 ) {
-    let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+    let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
+    let mut next_tick = Instant::now() + DRIVER_TICK_INTERVAL;
     loop {
-        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
-        match rx.recv_timeout(Duration::from_millis(1000)) {
-            Ok(Ev::Up(link, role, out)) => {
-                writers.insert(link, out);
-                guard_core("bearer-connected", || {
-                    node.handle(BearerEvent::Connected(link, role))
-                });
-            }
-            Ok(Ev::Data(link, bytes)) => {
-                guard_core("bearer-data", || {
-                    node.handle(BearerEvent::Data(link, bytes))
-                });
-            }
-            Ok(Ev::Down(link)) => {
-                writers.remove(&link);
-                guard_core("bearer-disconnected", || {
-                    node.handle(BearerEvent::Disconnected(link))
-                });
-            }
-            Ok(Ev::Fetched(to, for_id, status, headers, body)) => {
-                guard_core("http-response", || {
-                    let _ = node.send_http_response(to, for_id, status, headers, body);
-                });
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                guard_core("tick", || node.tick(now_ms()));
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+        if !process_driver_events(&mut node, &mut writers, &rx, &mut next_tick) {
+            break;
         }
 
         for r in guard_core("take-http-requests", || node.take_http_requests()).unwrap_or_default()
         {
             let now = now_ms();
-            let decision = gateway.screen(r.id, r.from, &r.method, &r.url, r.body.len(), now);
-            if decision != Screen::Allow {
-                let (status, msg) = deny_response(decision);
-                let ct = vec![("content-type".to_string(), "text/plain".to_string())];
-                let _ = tx.send(Ev::Fetched(r.from, r.id, status, ct, msg.into_bytes()));
-                continue;
-            }
+            let url = match gateway.screen(r.id, r.from, &r.method, &r.url, r.body.len(), now) {
+                Screen::Allow(url) => url,
+                decision => {
+                    let (status, msg) = deny_response(decision);
+                    let ct = vec![("content-type".to_string(), "text/plain".to_string())];
+                    apply_driver_event(
+                        &mut node,
+                        &mut writers,
+                        Ev::Fetched(r.from, r.id, status, ct, msg.into_bytes()),
+                    );
+                    continue;
+                }
+            };
             if INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_FETCHES {
                 INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
                 // services-r6-02: screen() Allowed this and recorded it for dedup, but we are shedding
@@ -278,19 +416,37 @@ fn run(
                 // client's retry of the same id is screened afresh instead of bouncing as Duplicate.
                 gateway.forget(r.id);
                 let ct = vec![("content-type".to_string(), "text/plain".to_string())];
-                let _ = tx.send(Ev::Fetched(
-                    r.from,
-                    r.id,
-                    503,
-                    ct,
-                    b"hop-gateway: busy".to_vec(),
-                ));
+                apply_driver_event(
+                    &mut node,
+                    &mut writers,
+                    Ev::Fetched(r.from, r.id, 503, ct, b"hop-gateway: busy".to_vec()),
+                );
                 continue;
             }
             let resp_cap = r.max_resp.min(max_resp);
+            let reservation = match tx.try_reserve_fetched(r.from, resp_cap) {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+                    gateway.forget(r.id);
+                    let headers = vec![("content-type".to_string(), "text/plain".to_string())];
+                    apply_driver_event(
+                        &mut node,
+                        &mut writers,
+                        Ev::Fetched(
+                            r.from,
+                            r.id,
+                            503,
+                            headers,
+                            b"hop-gateway: response budget saturated".to_vec(),
+                        ),
+                    );
+                    continue;
+                }
+            };
             let call = HttpCall {
                 method: r.method,
-                url: r.url,
+                url,
                 headers: r.headers,
                 body: r.body,
                 max_resp_bytes: resp_cap,
@@ -299,33 +455,132 @@ fn run(
             let (from, id) = (r.from, r.id);
             std::thread::spawn(move || {
                 let _guard = FetchGuard; // releases the in-flight slot on drop (incl. panic unwind)
-                let result = client.perform(call);
-                let _ = tx.send(Ev::Fetched(
-                    from,
-                    id,
-                    result.status,
-                    result.headers,
-                    result.body,
-                ));
+                match client.perform_reserved(call, reservation, FETCH_RESERVATION_TIMEOUT) {
+                    BudgetedHttpResult::Complete {
+                        result,
+                        reservation,
+                    } => {
+                        let _ = tx.send_reserved(
+                            reservation,
+                            Ev::Fetched(from, id, result.status, result.headers, result.body),
+                        );
+                    }
+                    BudgetedHttpResult::BudgetRejected(reservation) => {
+                        let headers = vec![("content-type".to_string(), "text/plain".to_string())];
+                        let _ = tx.send_reserved(
+                            reservation,
+                            Ev::Fetched(
+                                from,
+                                id,
+                                503,
+                                headers,
+                                b"hop-gateway: response budget saturated".to_vec(),
+                            ),
+                        );
+                    }
+                }
             });
         }
 
+        let mut blocked = Vec::new();
         for (link, bytes) in
             guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default()
         {
             if let Some(out) = writers.get(&link) {
-                if out.send(bytes).is_err() {
-                    writers.remove(&link);
+                if matches!(
+                    out.try_send(bytes),
+                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_))
+                ) {
+                    blocked.push(link);
                 }
             }
         }
+        for link in blocked {
+            writers.remove(&link);
+            guard_core("bearer-disconnected", || {
+                node.handle(BearerEvent::Disconnected(link))
+            });
+        }
+    }
+}
+
+fn process_driver_events(
+    node: &mut Node,
+    writers: &mut HashMap<u64, SyncSender<Vec<u8>>>,
+    rx: &EventRx,
+    next_tick: &mut Instant,
+) -> bool {
+    tick_if_due(node, next_tick);
+    let wait = next_tick.saturating_duration_since(Instant::now());
+    let first = match rx.recv_timeout(wait) {
+        Ok(event) => Some(event),
+        Err(RecvTimeoutError::Timeout) => {
+            tick_if_due(node, next_tick);
+            None
+        }
+        Err(RecvTimeoutError::Disconnected) => return false,
+    };
+    if let Some(first) = first {
+        apply_driver_event(node, writers, first);
+        for _ in 1..MAX_EVENT_BATCH {
+            if Instant::now() >= *next_tick {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(event) => apply_driver_event(node, writers, event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+    tick_if_due(node, next_tick);
+    true
+}
+
+fn apply_driver_event(node: &mut Node, writers: &mut HashMap<u64, SyncSender<Vec<u8>>>, event: Ev) {
+    match event {
+        Ev::Up(link, role, out) => {
+            writers.insert(link, out);
+            guard_core("bearer-connected", || {
+                node.handle(BearerEvent::Connected(link, role))
+            });
+        }
+        Ev::Data(link, bytes) => {
+            guard_core("bearer-data", || {
+                node.handle(BearerEvent::Data(link, bytes))
+            });
+        }
+        Ev::Down(link) => {
+            writers.remove(&link);
+            guard_core("bearer-disconnected", || {
+                node.handle(BearerEvent::Disconnected(link))
+            });
+        }
+        Ev::Fetched(to, for_id, status, headers, body) => {
+            guard_core("http-response", || {
+                let _ = node.send_http_response(to, for_id, status, headers, body);
+            });
+        }
+    }
+}
+
+fn tick_if_due(node: &mut Node, next_tick: &mut Instant) {
+    let monotonic_now = Instant::now();
+    if monotonic_now < *next_tick {
+        return;
+    }
+    let wall_now = now_ms();
+    LAST_TICK_MS.store(wall_now, Ordering::Relaxed);
+    guard_core("tick", || node.tick(wall_now));
+    while *next_tick <= monotonic_now {
+        *next_tick += DRIVER_TICK_INTERVAL;
     }
 }
 
 /// Map a non-Allow screen decision to an HTTP-ish status + a short body for the origin.
 fn deny_response(decision: Screen) -> (u16, String) {
     match decision {
-        Screen::Allow => (200, String::new()),
+        Screen::Allow(_) => (200, String::new()),
         Screen::Duplicate => (208, "hop-gateway: duplicate request".to_string()),
         Screen::RateLimited => (429, "hop-gateway: rate limited".to_string()),
         Screen::PolicyDenied => (403, "hop-gateway: policy denied".to_string()),
@@ -350,13 +605,19 @@ fn serve_healthz(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
+fn bearer_ws_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+}
+
 /// Dial a relay over `wss://` and bridge it as a Hop bearer link (Initiator). Reconnects with
 /// exponential backoff (services-11) so a dead relay isn't hammered.
-fn dial_relay(url: String, ev_tx: Sender<Ev>) {
+fn dial_relay(url: String, ev_tx: EventTx) {
     use tungstenite::stream::MaybeTlsStream;
     let mut failures: u32 = 0;
     loop {
-        match tungstenite::connect(&url) {
+        match tungstenite::client::connect_with_config(&url, Some(bearer_ws_config()), 3) {
             Ok((mut ws, _resp)) => {
                 failures = 0;
                 eprintln!("hop-gateway: connected to relay {url}");
@@ -370,7 +631,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                     _ => {}
                 }
                 let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
-                let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+                let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
                 if ev_tx.send(Ev::Up(link, Role::Initiator, out_tx)).is_err() {
                     return;
                 }
@@ -393,14 +654,23 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                             if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => break,
                     }
+                    let reservation = match ev_tx.reserve_frame(link) {
+                        Ok(reservation) => reservation,
+                        Err(QueueAdmissionError::TimedOut)
+                        | Err(QueueAdmissionError::QueueFull) => continue,
+                        Err(_) => break,
+                    };
                     match ws.read() {
                         Ok(Message::Binary(b)) => {
-                            if ev_tx.send(Ev::Data(link, b.to_vec())).is_err() {
+                            if ev_tx
+                                .send_reserved_frame(reservation, link, b.to_vec())
+                                .is_err()
+                            {
                                 return;
                             }
                         }
                         Ok(Message::Close(_)) => break,
-                        Ok(_) => {}
+                        Ok(_) => drop(reservation),
                         Err(tungstenite::Error::Io(e))
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -477,6 +747,90 @@ fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturated_driver_queue_still_ticks_prunes_and_limits_each_batch() {
+        let identity = Identity::generate();
+        let destination = Identity::generate();
+        let expiring = Bundle::create(
+            &identity,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"expire".to_vec(),
+            },
+            BundleOpts {
+                lifetime_ms: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expiring_id = expiring.id();
+        let mut node = Node::new(identity);
+        assert!(node.store.put(expiring, 0));
+
+        let (tx, rx) = event_channel();
+        for link in 0..MAX_EVENT_QUEUE_EVENTS / MAX_EVENT_SOURCE_EVENTS {
+            for _ in 0..MAX_EVENT_SOURCE_EVENTS {
+                tx.try_send(Ev::Data(link as u64, vec![link as u8]))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            tx.try_send(Ev::Data(100, vec![0])),
+            Err(QueueAdmissionError::QueueFull)
+        );
+        assert_eq!(tx.usage(), (MAX_EVENT_QUEUE_EVENTS, MAX_EVENT_QUEUE_EVENTS));
+
+        let mut writers = HashMap::new();
+        let mut next_tick = Instant::now();
+        assert!(process_driver_events(
+            &mut node,
+            &mut writers,
+            &rx,
+            &mut next_tick,
+        ));
+        assert!(!node.store.contains(&expiring_id));
+        assert_eq!(
+            tx.usage().0,
+            MAX_EVENT_QUEUE_EVENTS - MAX_EVENT_BATCH,
+            "one loop iteration consumes only a bounded batch"
+        );
+    }
+
+    #[test]
+    fn one_hundred_twenty_eight_fetch_producers_are_bounded_by_queue_plus_reservations() {
+        let (tx, rx) = event_channel();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(129));
+        let mut workers = Vec::new();
+        for index in 0..128u8 {
+            let tx = tx.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                tx.try_reserve_fetched([index; 32], MAX_FETCH_BODY_BYTES)
+                    .ok()
+            }));
+        }
+        barrier.wait();
+        let reservations: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            reservations.len(),
+            MAX_EVENT_QUEUE_BYTES / MAX_EVENT_BYTES,
+            "worker concurrency is coupled to the complete response byte ceiling"
+        );
+        assert!(tx.usage().1 <= MAX_EVENT_QUEUE_BYTES);
+        drop(reservations);
+        assert_eq!(tx.usage(), (0, 0));
+        assert!(tx
+            .try_reserve_fetched([255u8; 32], MAX_FETCH_BODY_BYTES)
+            .is_ok());
+        drop(rx);
+    }
 
     #[test]
     fn reconnect_backoff_grows_then_caps() {
