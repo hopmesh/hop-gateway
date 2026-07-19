@@ -156,6 +156,39 @@ fn parse_outbound_url(raw: &str) -> Option<Url> {
     Some(url)
 }
 
+/// services-r18-10 (ADV18-10): is `ip` a target an egress fetch must NEVER reach? The allowlist matches
+/// only the URL host STRING; it says nothing about where that host RESOLVES. An allowlisted name whose
+/// DNS the attacker controls (or any allowlisted name pointed at an internal address) would otherwise
+/// reach loopback, the cloud metadata endpoint (169.254.169.254), RFC1918/ULA internal ranges, or
+/// 0.0.0.0. Reject every non-global-unicast destination so a passed host string cannot be turned into
+/// an internal fetch. Redirects are already disabled, so vetting the resolved connect IP closes the gap.
+#[cfg(feature = "reqwest")]
+fn ip_is_forbidden(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                // Carrier-grade NAT 100.64.0.0/10 and the 0.0.0.0/8 "this network" block.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local fc00::/7 and link-local fe80::/10.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // An IPv4-mapped v6 address must be vetted as its embedded v4.
+                || v6.to_ipv4_mapped().map(IpAddr::V4).map(ip_is_forbidden).unwrap_or(false)
+        }
+    }
+}
+
 impl EgressPolicy for Allowlist {
     fn allows(&self, method: &str, url: &Url) -> bool {
         if !self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
@@ -427,7 +460,13 @@ pub enum Screen {
 /// exhaust gateway memory. Gated behind the `reqwest` feature so the trait-only lib stays lean.
 #[cfg(feature = "reqwest")]
 pub struct ReqwestHttpClient {
-    http: reqwest::blocking::Client,
+    // ADV18-10: every request builds a per-call client PINNED to the vetted resolved IPs (see
+    // `vetted_client`), so there is no shared pre-built client to keep here; only the timeouts.
+    timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+    /// ADV18-10: block egress to loopback/private/metadata addresses (the safe default). A deployment
+    /// that legitimately fronts an internal backend flips this on explicitly; production leaves it off.
+    allow_private_egress: bool,
 }
 
 #[cfg(feature = "reqwest")]
@@ -455,13 +494,70 @@ impl ReqwestHttpClient {
     /// Build a client with a total request `timeout` and a separate `connect_timeout`. Redirects are
     /// disabled (an egress fetch must hit exactly the allowlisted URL, never a redirect target).
     pub fn new(timeout: std::time::Duration, connect_timeout: std::time::Duration) -> Self {
-        let http = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(connect_timeout)
+        Self {
+            timeout,
+            connect_timeout,
+            allow_private_egress: false,
+        }
+    }
+
+    /// Build a client that MAY reach loopback/private addresses. For a deployment that fronts a trusted
+    /// internal backend, or a loopback-server test. Production uses [`new`]/[`default`] (fail-safe off).
+    pub fn new_allowing_private_egress(
+        timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            timeout,
+            connect_timeout,
+            allow_private_egress: true,
+        }
+    }
+
+    /// ADV18-10: resolve `url`'s host, reject any resolution to a forbidden (internal/loopback/
+    /// metadata) address, and return a client PINNED to the vetted addresses so the actual connection
+    /// cannot rebind to a different, hostile IP between the check and the connect. Returns an HTTP
+    /// status on refusal (403 for a forbidden target, 502 for an unresolvable one).
+    fn vetted_client(&self, url: &str) -> std::result::Result<reqwest::blocking::Client, u16> {
+        use std::net::ToSocketAddrs;
+        let parsed = reqwest::Url::parse(url).map_err(|_| 400u16)?;
+        // `host_str()` returns an IPv6 literal WITH surrounding brackets (`[::1]`); strip them so both
+        // the IP-literal parse and `to_socket_addrs` see the bare address.
+        let raw_host = parsed.host_str().ok_or(400u16)?;
+        let host = raw_host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(raw_host);
+        // Default the port per scheme so resolution has a socket to form (the value is only used to
+        // vet + pin the IP; reqwest still drives the real request through `url`).
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+        // Vet an IP literal directly (no DNS); otherwise resolve the name.
+        let addrs: Vec<std::net::SocketAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            vec![std::net::SocketAddr::new(ip, port)]
+        } else {
+            (host, port)
+                .to_socket_addrs()
+                .map_err(|_| 502u16)?
+                .collect()
+        };
+        if addrs.is_empty() {
+            return Err(502);
+        }
+        // The filter blocks loopback/private targets unless this client was explicitly built to allow
+        // them (a trusted internal backend, or a loopback-server test); production stays fail-safe.
+        if !self.allow_private_egress && addrs.iter().any(|a| ip_is_forbidden(a.ip())) {
+            return Err(403);
+        }
+        // Pin the connection to exactly the vetted addresses (defeats DNS rebinding).
+        reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(self.connect_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addrs)
             .build()
-            .expect("build reqwest client");
-        Self { http }
+            .map_err(|_| 502u16)
     }
 
     pub fn perform_reserved<R: ResponseReservation>(
@@ -485,7 +581,24 @@ impl ReqwestHttpClient {
                 }
             }
         };
-        let mut request = self.http.request(method, call.url);
+        // ADV18-10: resolve the target once, reject any resolution to an internal/loopback/metadata
+        // address, and PIN the connection to the vetted IPs (closing the DNS-rebinding TOCTOU) before
+        // any request leaves the process. `call.url` is the already-policy-screened URL.
+        let url_str = call.url.to_string();
+        let http = match self.vetted_client(&url_str) {
+            Ok(client) => client,
+            Err(status) => {
+                return BudgetedHttpResult::Complete {
+                    result: HttpResult {
+                        status,
+                        headers: vec![],
+                        body: b"hop-gateway: egress target not permitted".to_vec(),
+                    },
+                    reservation,
+                }
+            }
+        };
+        let mut request = http.request(method, call.url);
         for (name, value) in sanitized_request_headers(&call.headers) {
             request = request.header(name, value);
         }
@@ -647,6 +760,64 @@ mod tests {
 
     #[cfg(feature = "reqwest")]
     #[test]
+    fn ssrf_ip_filter_rejects_internal_and_metadata_targets() {
+        // ADV18-10: the resolved-IP filter must reject every non-public destination so an allowlisted
+        // host name pointed at an internal address cannot become an internal fetch.
+        use std::net::IpAddr;
+        let forbid = |s: &str| ip_is_forbidden(s.parse::<IpAddr>().unwrap());
+        // Loopback, metadata, RFC1918, link-local, CGNAT, unspecified, 0.0.0.0/8, ULA, v6 link-local,
+        // and an IPv4-mapped-v6 loopback all rejected.
+        for bad in [
+            "127.0.0.1",
+            "127.9.9.9",
+            "169.254.169.254", // cloud metadata
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "100.100.0.1", // carrier-grade NAT
+            "0.0.0.0",
+            "0.1.2.3",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(forbid(bad), "{bad} must be rejected as an egress target");
+        }
+        // Public unicast is allowed.
+        for ok in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(!forbid(ok), "{ok} is a public target and must be allowed");
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn vetted_client_refuses_loopback_and_metadata_urls() {
+        // ADV18-10 end to end: the reqwest client must refuse a URL resolving to an internal address
+        // with 403, before any request leaves the process.
+        let client = ReqwestHttpClient::default();
+        for url in [
+            "http://127.0.0.1/collect",
+            "http://localhost/collect",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+            "http://10.0.0.1/x",
+        ] {
+            assert_eq!(
+                client.vetted_client(url).err(),
+                Some(403),
+                "{url} must be refused as a forbidden egress target"
+            );
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
     fn production_client_derives_host_and_strips_hop_by_hop_headers() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
@@ -680,7 +851,13 @@ mod tests {
                 .unwrap();
         });
 
-        let result = ReqwestHttpClient::default().perform(HttpCall {
+        // This test drives a real loopback server, so build a client that permits private egress
+        // (production uses the fail-safe default that blocks it, exercised by the SSRF tests above).
+        let result = ReqwestHttpClient::new_allowing_private_egress(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        )
+        .perform(HttpCall {
             method: "GET".into(),
             url: Url::parse(&url).unwrap(),
             headers: vec![
@@ -739,7 +916,11 @@ mod tests {
             .unwrap();
         });
 
-        let result = ReqwestHttpClient::default().perform(HttpCall {
+        let result = ReqwestHttpClient::new_allowing_private_egress(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        )
+        .perform(HttpCall {
             method: "GET".into(),
             url: origin_url,
             headers: vec![],
@@ -804,7 +985,11 @@ mod tests {
                 .to_vec();
         chunked.extend_from_slice(&body);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        let result = ReqwestHttpClient::default().perform_reserved(
+        let result = ReqwestHttpClient::new_allowing_private_egress(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        )
+        .perform_reserved(
             HttpCall {
                 method: "GET".into(),
                 url: serve(chunked),
@@ -837,7 +1022,11 @@ mod tests {
             "y".repeat(1000)
         )
         .into_bytes();
-        let result = ReqwestHttpClient::default().perform_reserved(
+        let result = ReqwestHttpClient::new_allowing_private_egress(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        )
+        .perform_reserved(
             HttpCall {
                 method: "GET".into(),
                 url: serve(oversized),
