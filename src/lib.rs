@@ -95,7 +95,7 @@ impl HttpClient for NoHttpClient {
     }
 }
 
-/// Permit everything — for tests/dev only. Production ships an [`Allowlist`].
+/// Permit everything, for tests/dev only. Production ships an [`Allowlist`].
 pub struct AllowAll;
 impl EgressPolicy for AllowAll {
     fn allows(&self, _method: &str, _url: &Url) -> bool {
@@ -278,7 +278,7 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         }
     }
 
-    /// The gateway's address — clients seal egress requests to this (approach (c)).
+    /// The gateway's address; clients seal egress requests to this (approach (c)).
     pub fn address(&self) -> PubKeyBytes {
         self.identity.address()
     }
@@ -287,7 +287,7 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
     /// caps. The response is sealed back to the request's `src` address.
     pub fn fulfill(&mut self, request: &Bundle, now_ms: u64) -> Result<FulfillOutcome> {
         // Egress requests are now device-addressed to the gateway (like a hop-endpoint),
-        // not a mesh-visible `InternetEgress` destination — the mesh can't tell an egress
+        // not a mesh-visible `InternetEgress` destination, the mesh can't tell an egress
         // request from any other peer message (§30, privacy by default).
         let to_us = match &request.inner.dst {
             Destination::Device(d) => *d == self.address(),
@@ -298,7 +298,7 @@ impl<C: HttpClient, P: EgressPolicy> Gateway<C, P> {
         }
         request.verify()?;
 
-        // Dedup within the TTL window (DESIGN.md §7) — pruned to bound memory.
+        // Dedup within the TTL window (DESIGN.md §7), pruned to bound memory.
         let ttl = self.config.dedup_ttl_ms;
         self.fulfilled
             .retain(|_, &mut t| now_ms.saturating_sub(t) < ttl);

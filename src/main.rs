@@ -1,4 +1,4 @@
-//! # hop-gateway — the internet-egress node (DESIGN.md §9)
+//! # hop-gateway: the internet-egress node (DESIGN.md §9)
 //!
 //! An operator runs this to let mesh clients reach the public internet through a policy-gated
 //! egress point. It is a **routable Hop leaf** (dials a relay, reachable by its address) whose only
@@ -287,7 +287,7 @@ fn main() {
     }
 
     // services-r3-03: env fallbacks (so infra can gate the relay dial without a CLI change) via the
-    // ONE shared, tested precedence helper — identical to hop-endpoint, so the two cannot drift.
+    // ONE shared, tested precedence helper, identical to hop-endpoint, so the two cannot drift.
     relay = resolve_relay(
         relay,
         relay_cli_set,
